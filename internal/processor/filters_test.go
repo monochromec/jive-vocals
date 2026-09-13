@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newTestBaseConfig creates a minimal BaseFilterConfig for testing.
@@ -16,6 +17,11 @@ func newTestBaseConfig() *BaseFilterConfig {
 		Downmix:  DownmixConfig{Enabled: false},
 		Analysis: AnalysisConfig{Enabled: false},
 		Resample: ResampleConfig{Enabled: false, SampleRate: 44100, Format: "s16", FrameSize: 4096},
+		SilenceTrim: SilenceTrimConfig{
+			Enabled:     false,
+			MaxDuration: 2 * time.Second,
+			Threshold:   -50.0,
+		},
 		RumbleHighPass: RumbleHighPassConfig{
 			Enabled:   false,
 			Frequency: 80.0,
@@ -89,6 +95,9 @@ func TestDefaultFilterConfigComposesTypedDefaults(t *testing.T) {
 	}
 	if config.Resample != defaultResampleConfig() {
 		t.Errorf("Resample = %+v, want %+v", config.Resample, defaultResampleConfig())
+	}
+	if config.SilenceTrim != defaultSilenceTrimConfig() {
+		t.Errorf("SilenceTrim = %+v, want %+v", config.SilenceTrim, defaultSilenceTrimConfig())
 	}
 	if config.RumbleHighPass != defaultRumbleHighPassConfig() {
 		t.Errorf("RumbleHighPass = %+v, want %+v", config.RumbleHighPass, defaultRumbleHighPassConfig())
@@ -1458,6 +1467,153 @@ func TestAnalysisSegmentSharedAcrossPasses(t *testing.T) {
 	if !strings.HasPrefix(pass2Ebur128, ebur128AnalysisSpecPrefix) {
 		t.Errorf("Pass-2 ebur128 %q does not start with shared prefix %q", pass2Ebur128, ebur128AnalysisSpecPrefix)
 	}
+}
+
+func TestBuildSilenceTrimFilter(t *testing.T) {
+	t.Run("disabled returns empty string", func(t *testing.T) {
+		config := newTestConfig()
+		config.SilenceTrim.Enabled = false
+
+		result := config.buildSilenceTrimFilter()
+
+		if result != "" {
+			t.Errorf("buildSilenceTrimFilter() = %q, want empty string", result)
+		}
+	})
+
+	t.Run("zero MaxDuration returns empty string even when enabled", func(t *testing.T) {
+		config := newTestConfig()
+		config.SilenceTrim.Enabled = true
+		config.SilenceTrim.MaxDuration = 0
+
+		result := config.buildSilenceTrimFilter()
+
+		if result != "" {
+			t.Errorf("buildSilenceTrimFilter() = %q, want empty string", result)
+		}
+	})
+
+	t.Run("no regions falls back to deterministic silenceremove", func(t *testing.T) {
+		config := newTestConfig()
+		config.SilenceTrim.Enabled = true
+		config.SilenceTrim.MaxDuration = 2 * time.Second
+		config.SilenceTrim.Threshold = -45.0
+		config.SilenceRegions = nil
+
+		result := config.buildSilenceTrimFilter()
+
+		expected := "silenceremove=start_periods=1:start_duration=2.000:start_threshold=-45.0dB:" +
+			"stop_periods=1:stop_duration=2.000:stop_threshold=-45.0dB:start_silence=2.000:stop_silence=2.000"
+		if result != expected {
+			t.Errorf("buildSilenceTrimFilter() = %q, want %q", result, expected)
+		}
+	})
+
+	t.Run("zero threshold falls back to -50dB default", func(t *testing.T) {
+		config := newTestConfig()
+		config.SilenceTrim.Enabled = true
+		config.SilenceTrim.MaxDuration = 1 * time.Second
+		config.SilenceTrim.Threshold = 0 // unset - ProcessAudio didn't have a measured room-tone level
+		config.SilenceRegions = nil
+
+		result := config.buildSilenceTrimFilter()
+
+		if !strings.Contains(result, "start_threshold=-50.0dB") {
+			t.Errorf("buildSilenceTrimFilter() = %q, want -50.0dB fallback threshold", result)
+		}
+	})
+
+	t.Run("populated regions produce a segmented atrim+concat graph", func(t *testing.T) {
+		config := newTestConfig()
+		config.SilenceTrim.Enabled = true
+		config.SilenceTrim.MaxDuration = 2 * time.Second
+		// One short gap (kept as-is) and one long gap (truncated to MaxDuration).
+		config.SilenceRegions = []*SilenceRegion{
+			{Start: 10 * time.Second, End: 11 * time.Second},         // 1s: kept whole
+			{Start: 20 * time.Second, End: 25500 * time.Millisecond}, // 5.5s: truncated to 2s
+		}
+
+		result := config.buildSilenceTrimFilter()
+
+		if !strings.HasPrefix(result, "[in]asplit=") {
+			t.Fatalf("buildSilenceTrimFilter() = %q, want a [in]asplit=... filtergraph", result)
+		}
+		if !strings.HasSuffix(result, "[silence_trimmed]") {
+			t.Errorf("buildSilenceTrimFilter() = %q, want it to end in [silence_trimmed]", result)
+		}
+		// The short 1s gap is kept in full (end=11.000000)...
+		if !strings.Contains(result, "atrim=start=10.000000:end=11.000000") {
+			t.Errorf("buildSilenceTrimFilter() missing untruncated short gap segment: %q", result)
+		}
+		// ...the long 5.5s gap is truncated to start+MaxDuration (20 + 2 = 22)...
+		if !strings.Contains(result, "atrim=start=20.000000:end=22.000000") {
+			t.Errorf("buildSilenceTrimFilter() missing truncated long gap segment: %q", result)
+		}
+		// ...and the pre-gap, inter-gap, and trailing audio segments are all present.
+		if !strings.Contains(result, "atrim=start=0.000000:end=10.000000") {
+			t.Errorf("buildSilenceTrimFilter() missing leading audio segment: %q", result)
+		}
+		if !strings.Contains(result, "atrim=start=11.000000:end=20.000000") {
+			t.Errorf("buildSilenceTrimFilter() missing inter-gap audio segment: %q", result)
+		}
+		if !strings.Contains(result, "atrim=start=25.500000,asetpts") {
+			t.Errorf("buildSilenceTrimFilter() missing trailing audio segment: %q", result)
+		}
+	})
+}
+
+func TestBuildFilterSpecSilenceTrim(t *testing.T) {
+	t.Run("disabled by default, no-op in the chain", func(t *testing.T) {
+		config := newTestConfig()
+		config.Resample.Enabled = true
+		config.FilterOrder = []FilterID{FilterSilenceTrim, FilterResample}
+
+		spec := config.BuildFilterSpec()
+
+		if strings.Contains(spec, "silenceremove=") || strings.Contains(spec, "[in]asplit=") {
+			t.Errorf("BuildFilterSpec() = %q, want no silence-trim filter when disabled", spec)
+		}
+	})
+
+	t.Run("enabled with no regions joins with a comma like any other filter", func(t *testing.T) {
+		config := newTestConfig()
+		config.SilenceTrim.Enabled = true
+		config.SilenceTrim.MaxDuration = 2 * time.Second
+		config.Resample.Enabled = true
+		config.FilterOrder = []FilterID{FilterSilenceTrim, FilterResample}
+
+		spec := config.BuildFilterSpec()
+
+		expected := "silenceremove=start_periods=1:start_duration=2.000:start_threshold=-50.0dB:" +
+			"stop_periods=1:stop_duration=2.000:stop_threshold=-50.0dB:start_silence=2.000:stop_silence=2.000," +
+			"aformat=sample_rates=44100:channel_layouts=mono:sample_fmts=s16,asetnsamples=n=4096"
+		if spec != expected {
+			t.Errorf("BuildFilterSpec() = %q, want %q", spec, expected)
+		}
+	})
+
+	t.Run("enabled with regions splices the chain around the filtergraph", func(t *testing.T) {
+		config := newTestConfig()
+		config.SilenceTrim.Enabled = true
+		config.SilenceTrim.MaxDuration = 2 * time.Second
+		config.SilenceRegions = []*SilenceRegion{{Start: 5 * time.Second, End: 8 * time.Second}}
+		config.Downmix.Enabled = true
+		config.Resample.Enabled = true
+		config.FilterOrder = []FilterID{FilterDownmix, FilterSilenceTrim, FilterResample}
+
+		spec := config.BuildFilterSpec()
+
+		// Downmix (built before the trim graph) must be wrapped into a
+		// "[in]...[trim_input]" stage feeding the asplit, joined with ";" not ",".
+		if !strings.Contains(spec, "[in]aformat=channel_layouts=mono[trim_input];[trim_input]asplit=") {
+			t.Errorf("BuildFilterSpec() did not wrap the pre-trim chain into [trim_input]: %q", spec)
+		}
+		// Resample (built after the trim graph) must pick up the "[silence_trimmed]"
+		// input label and be joined with ";" not ",".
+		if !strings.Contains(spec, "[silence_trimmed]aformat=sample_rates=44100") {
+			t.Errorf("BuildFilterSpec() did not label the post-trim chain with [silence_trimmed]: %q", spec)
+		}
+	})
 }
 
 func TestBuildResampleFilter(t *testing.T) {

@@ -105,6 +105,15 @@ func ProcessAudio(ctx context.Context, inputPath string, config *BaseFilterConfi
 		return nil, fmt.Errorf("adaptive config failed for %s: base filter config is nil or invalid", inputPath)
 	}
 
+	// Substitute the measured room-tone level for buildSilenceTrimFilter's
+	// static default threshold, when silence trimming is on and Pass 1 measured
+	// one for this file. RoomToneDetectLevel is set unconditionally by Pass 1
+	// (see analyser.go), so the != 0 guard only excludes the zero-value case of
+	// an AudioMeasurements built without running Pass 1 (e.g. in tests).
+	if effectiveConfig.SilenceTrim.Enabled && measurements.Noise.RoomToneDetectLevel != 0 {
+		effectiveConfig.SilenceTrim.Threshold = measurements.Noise.RoomToneDetectLevel
+	}
+
 	// Pass 2: Processing. The start event also surfaces the just-derived effective
 	// config and diagnostics (read-only) so the TUI can light its filter-chain
 	// status boxes; this carries no DSP and does not alter AdaptConfig.

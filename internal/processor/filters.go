@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	ffmpeg "github.com/linuxmatters/ffmpeg-statigo"
 )
@@ -26,6 +27,9 @@ const (
 	FilterBandlimitLowPass FilterID = "bandlimit_lowpass" // #nosec G101 -- FFmpeg filter id, not a credential. Unconditional 20.5 kHz band-limit (ultrasonic rejection).
 	FilterSpeechGate       FilterID = "speech_gate"       // soft expander for inter-speech gaps
 
+	// FilterSilenceTrim trims/truncates long silence segments (Pass 2 only, off by default).
+	FilterSilenceTrim FilterID = "silence_trim"
+
 	// NoiseReduction - anlmdn + afftdn noise reduction (Pass 2 only)
 	// Non-Local Means denoiser followed by an FFT spectral denoiser
 	FilterNoiseReduction FilterID = "noise_reduction"
@@ -46,17 +50,21 @@ var Pass1FilterOrder = []FilterID{
 
 // Pass2FilterOrder defines the filter chain for processing pass.
 // Order rationale:
-// - Downmix first: ensures all downstream filters work with mono
-// - RumbleHighPass: removes subsonic rumble before other filters
-// - BandlimitLowPass: unconditional 20.5 kHz band-limit (removes inaudible ultrasonics)
-// - NoiseReduction: primary noise reduction using anlmdn + afftdn
-// - SpeechGate: soft expander for inter-speech cleanup (after denoising lowers floor)
-// - LevellingCompressor: gentle levelling evens dynamics before normalisation
-// - Deesser: after compression (which emphasises sibilance)
-// - Analysis: measures output for comparison with Pass 1 (ebur128 upsamples to 192kHz/f64)
-// - Resample: standardises output format (44.1kHz/16-bit/mono) - MUST be last
+//   - Downmix first: ensures all downstream filters work with mono
+//   - SilenceTrim: trims/truncates long silence before any DSP touches it, so
+//     downstream filters (and their measurement in Pass 3/4) never process audio
+//     that will not ship. Off by default; a no-op when disabled.
+//   - RumbleHighPass: removes subsonic rumble before other filters
+//   - BandlimitLowPass: unconditional 20.5 kHz band-limit (removes inaudible ultrasonics)
+//   - NoiseReduction: primary noise reduction using anlmdn + afftdn
+//   - SpeechGate: soft expander for inter-speech cleanup (after denoising lowers floor)
+//   - LevellingCompressor: gentle levelling evens dynamics before normalisation
+//   - Deesser: after compression (which emphasises sibilance)
+//   - Analysis: measures output for comparison with Pass 1 (ebur128 upsamples to 192kHz/f64)
+//   - Resample: standardises output format (44.1kHz/16-bit/mono) - MUST be last
 var Pass2FilterOrder = []FilterID{
 	FilterDownmix,
+	FilterSilenceTrim,
 	FilterRumbleHighPass,
 	FilterBandlimitLowPass,
 	FilterNoiseReduction,
@@ -116,6 +124,18 @@ type filterConfigDefaults struct {
 	Analysis AnalysisConfig `json:"-"`
 	Resample ResampleConfig `json:"-"`
 
+	// SilenceTrim controls Pass 2 silence trimming. Off by default, so it stays
+	// out of the §8.1 report block like the other orchestration configs above.
+	SilenceTrim SilenceTrimConfig `json:"-"`
+
+	// SilenceRegions holds detected silence regions from Pass 1 analysis, for the
+	// region-aware atrim/concat path in buildSilenceTrimFilter. Always empty
+	// today: populating it requires an enumerable list of per-file silence gaps,
+	// which the current room-tone-region analyser model doesn't yield directly
+	// (see buildSilenceTrimFilter's doc comment). Pass-local state, not part of
+	// the base configuration, so it is excluded here too.
+	SilenceRegions []*SilenceRegion `json:"-"`
+
 	RumbleHighPass      RumbleHighPassConfig      `json:"rumble_highpass"`
 	BandlimitLowPass    BandlimitLowPassConfig    `json:"bandlimit_lowpass"`
 	NoiseReduction      NoiseReductionConfig      `json:"noise_reduction"`
@@ -144,6 +164,23 @@ type ResampleConfig struct {
 	SampleRate int
 	Format     string
 	FrameSize  int
+}
+
+// SilenceTrimConfig controls Pass 2 silence trimming. Threshold is overwritten
+// per-file in ProcessAudio from the measured room-tone level when available
+// (Noise.RoomToneDetectLevel), falling back to this default otherwise.
+type SilenceTrimConfig struct {
+	Enabled     bool
+	MaxDuration time.Duration
+	Threshold   float64
+}
+
+// SilenceRegion marks a detected silence gap [Start, End) for the region-aware
+// atrim/concat path in buildSilenceTrimFilter. See SilenceRegions on
+// filterConfigDefaults: unpopulated today.
+type SilenceRegion struct {
+	Start time.Duration
+	End   time.Duration
 }
 
 // BiquadFilterConfig holds the shared parameters for a single biquad pole/zero
@@ -326,6 +363,7 @@ var filterBuilders = map[FilterID]filterBuilderFunc{
 	FilterDownmix:             (*EffectiveFilterConfig).buildDownmixFilter,
 	FilterAnalysis:            (*EffectiveFilterConfig).buildAnalysisFilter,
 	FilterResample:            (*EffectiveFilterConfig).buildResampleFilter,
+	FilterSilenceTrim:         (*EffectiveFilterConfig).buildSilenceTrimFilter,
 	FilterRumbleHighPass:      (*EffectiveFilterConfig).buildRumbleHighpassFilter,
 	FilterBandlimitLowPass:    (*EffectiveFilterConfig).buildBandlimitLowPassFilter,
 	FilterNoiseReduction:      (*EffectiveFilterConfig).buildNoiseReductionFilter,
@@ -404,6 +442,17 @@ func defaultResampleConfig() ResampleConfig {
 		SampleRate: 44100,
 		Format:     "s16",
 		FrameSize:  4096,
+	}
+}
+
+// defaultSilenceTrimConfig returns silence trimming disabled by default, a
+// 2s max-kept-silence duration, and a static -50dB fallback threshold used
+// only if ProcessAudio has no measured room-tone level to substitute.
+func defaultSilenceTrimConfig() SilenceTrimConfig {
+	return SilenceTrimConfig{
+		Enabled:     false,
+		MaxDuration: 2 * time.Second,
+		Threshold:   -50.0,
 	}
 }
 
@@ -876,6 +925,110 @@ func (cfg *EffectiveFilterConfig) buildDeesserFilter() string {
 	)
 }
 
+// buildSilenceTrimFilter builds the silence trimming filter specification.
+//
+// Two paths, selected by whether SilenceRegions is populated:
+//
+//   - No regions (the only path reachable today): returns a single
+//     deterministic "silenceremove=" spec that lets FFmpeg's own runtime
+//     silence detector do the trimming at encode time, using MaxDuration as
+//     the kept-silence length on both ends and Threshold as the level.
+//   - Regions populated: returns a segmented "[in]asplit=...;...;concat=...
+//     [silence_trimmed]" filtergraph that truncates each measured silence gap
+//     individually to at most MaxDuration, splicing in the untouched audio
+//     between gaps. BuildFilterSpec below detects the "[in]"-prefixed spec
+//     this path returns and threads the surrounding chain in and out of it.
+//
+// SilenceRegions is never populated by this port (see the field's doc comment
+// on filterConfigDefaults), so only the first path currently runs; the second
+// is kept as correct, ready infrastructure for that follow-up rather than
+// dead weight to trim.
+func (cfg *EffectiveFilterConfig) buildSilenceTrimFilter() string {
+	trim := cfg.SilenceTrim
+	if !trim.Enabled || trim.MaxDuration <= 0 {
+		return ""
+	}
+
+	leaveSeconds := trim.MaxDuration.Seconds()
+	threshold := trim.Threshold
+	if threshold == 0 {
+		threshold = -50.0
+	}
+
+	// If we don't have per-file silence regions from analysis, fall back to
+	// the deterministic silenceremove spec to keep tests and simple cases stable.
+	if len(cfg.SilenceRegions) == 0 {
+		return fmt.Sprintf(
+			"silenceremove=start_periods=1:start_duration=%.3f:start_threshold=%.1fdB:"+
+				"stop_periods=1:stop_duration=%.3f:stop_threshold=%.1fdB:start_silence=%.3f:stop_silence=%.3f",
+			leaveSeconds,
+			threshold,
+			leaveSeconds,
+			threshold,
+			leaveSeconds,
+			leaveSeconds,
+		)
+	}
+
+	// Build segmented atrim + concat graph based on measured silence regions.
+	maxSeconds := trim.MaxDuration.Seconds()
+
+	var parts []string
+	var segLabels []string
+	segIdx := 0
+	lastEnd := 0.0
+
+	for _, region := range cfg.SilenceRegions {
+		rs := region.Start.Seconds()
+		re := region.End.Seconds()
+
+		// Add preceding non-silence audio (if any)
+		if rs > lastEnd {
+			parts = append(parts, fmt.Sprintf("[src%d]atrim=start=%f:end=%f,asetpts=PTS-STARTPTS[seg%d]",
+				segIdx, lastEnd, rs, segIdx))
+			segLabels = append(segLabels, fmt.Sprintf("[seg%d]", segIdx))
+			segIdx++
+		}
+
+		// Add silence segment (possibly truncated)
+		silenceDur := re - rs
+		if silenceDur <= 0 {
+			lastEnd = re
+			continue
+		}
+		if silenceDur > maxSeconds {
+			// Truncate silence to maxSeconds
+			parts = append(parts, fmt.Sprintf("[src%d]atrim=start=%f:end=%f,asetpts=PTS-STARTPTS[seg%d]",
+				segIdx, rs, rs+maxSeconds, segIdx))
+			segLabels = append(segLabels, fmt.Sprintf("[seg%d]", segIdx))
+			segIdx++
+		} else {
+			parts = append(parts, fmt.Sprintf("[src%d]atrim=start=%f:end=%f,asetpts=PTS-STARTPTS[seg%d]",
+				segIdx, rs, re, segIdx))
+			segLabels = append(segLabels, fmt.Sprintf("[seg%d]", segIdx))
+			segIdx++
+		}
+		lastEnd = re
+	}
+
+	// Add trailing audio from lastEnd to EOF
+	parts = append(parts, fmt.Sprintf("[src%d]atrim=start=%f,asetpts=PTS-STARTPTS[seg%d]",
+		segIdx, lastEnd, segIdx))
+	segLabels = append(segLabels, fmt.Sprintf("[seg%d]", segIdx))
+
+	// Build concat invocation
+	sourceLabels := make([]string, len(parts))
+	for i := range sourceLabels {
+		sourceLabels[i] = fmt.Sprintf("[src%d]", i)
+	}
+	split := fmt.Sprintf("[in]asplit=%d%s", len(sourceLabels), strings.Join(sourceLabels, ""))
+	segmentDefs := split + ";" + strings.Join(parts, ";")
+	concatInputs := strings.Join(segLabels, "")
+	concatSpec := fmt.Sprintf("%sconcat=n=%d:v=0:a=1[silence_trimmed]", concatInputs, len(segLabels))
+
+	return segmentDefs + ";" + concatSpec
+}
+
 // buildAdeclickFilter builds the click/pop repair filter specification.
 // Uses interpolation to repair waveform discontinuities.
 // Applied in Pass 4 after loudnorm to catch clicks from limiter and gain changes.
@@ -920,17 +1073,56 @@ func (cfg *EffectiveFilterConfig) BuildFilterSpec() string {
 		order = Pass2FilterOrder
 	}
 
-	// Build filters in specified order, skipping disabled/empty
+	// Build filters in specified order, skipping disabled/empty. silenceTrimGraph
+	// tracks whether the last appended spec was the "[in]asplit=...[silence_trimmed]"
+	// filtergraph form of buildSilenceTrimFilter (only when SilenceRegions is
+	// populated - see that function's doc comment): the chain built so far gets
+	// wrapped into a "[trim_input]" label feeding the graph, and the very next
+	// filter after it gets a "[silence_trimmed]" input label, since both ends of
+	// that filtergraph are pad-addressed rather than implicit pipeline stages.
 	var filters []string
+	silenceTrimGraph := false
 	for _, id := range order {
-		if builder, ok := filterBuilders[id]; ok {
-			if spec := builder(cfg); spec != "" {
-				filters = append(filters, spec)
-			}
+		builder, ok := filterBuilders[id]
+		if !ok {
+			continue
 		}
+		spec := builder(cfg)
+		if spec == "" {
+			continue
+		}
+		if id == FilterSilenceTrim && strings.HasPrefix(spec, "[in]") {
+			if len(filters) > 0 {
+				filters = []string{"[in]" + strings.Join(filters, ",") + "[trim_input]"}
+				spec = strings.Replace(spec, "[in]asplit=", "[trim_input]asplit=", 1)
+			}
+			filters = append(filters, spec)
+			silenceTrimGraph = true
+			continue
+		}
+		if silenceTrimGraph {
+			spec = "[silence_trimmed]" + spec
+			silenceTrimGraph = false
+		}
+		filters = append(filters, spec)
 	}
 
-	return strings.Join(filters, ",")
+	if len(filters) == 0 {
+		return ""
+	}
+	// Joined incrementally (not via a single strings.Join) because the
+	// separator varies per position: "[trim_input]"/"[silence_trimmed]"-labelled
+	// specs are separate filtergraph statements needing ";", everything else is
+	// a pipeline stage needing ",".
+	result := filters[0]
+	for _, filter := range filters[1:] {
+		separator := ","
+		if strings.HasPrefix(filter, "[trim_input]") || strings.HasPrefix(filter, "[silence_trimmed]") {
+			separator = ";"
+		}
+		result += separator + filter
+	}
+	return result
 }
 
 // CreateProcessingFilterGraph creates an AVFilterGraph for complete audio processing

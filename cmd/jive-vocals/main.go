@@ -37,11 +37,13 @@ var createDebugLogFile = os.Create
 
 // CLI defines the command-line interface parsed by kong.
 type CLI struct {
-	Version      bool     `short:"v" help:"Show version information"`
-	Debug        bool     `short:"d" help:"Enable debug logging to jive-vocals-debug.log"`
-	AnalysisOnly bool     `short:"a" help:"Run analysis only (Pass 1), display results, skip processing"`
-	Diagnostics  bool     `name:"diagnostics" help:"Write bulk diagnostic artefacts for sweeps and quality comparison: the .intervals.jsonl and .candidates.jsonl sidecars plus before/after spectrogram PNGs (whole-file and elected room-tone/speech regions). Adds extra FFmpeg passes. Off by default." default:"false"`
-	Files        []string `arg:"" name:"files" help:"Audio files to process" type:"existingfile" optional:""`
+	Version      bool          `short:"v" help:"Show version information"`
+	Debug        bool          `short:"d" help:"Enable debug logging to jive-vocals-debug.log"`
+	AnalysisOnly bool          `short:"a" help:"Run analysis only (Pass 1), display results, skip processing"`
+	Diagnostics  bool          `name:"diagnostics" help:"Write bulk diagnostic artefacts for sweeps and quality comparison: the .intervals.jsonl and .candidates.jsonl sidecars plus before/after spectrogram PNGs (whole-file and elected room-tone/speech regions). Adds extra FFmpeg passes. Off by default." default:"false"`
+	Silence      bool          `short:"s" name:"silence" help:"Enable silence trimming in Pass 2 (see --cut)" default:"false"`
+	Cut          time.Duration `short:"c" name:"cut" help:"Maximum silence duration to keep when --silence is enabled" default:"2s"`
+	Files        []string      `arg:"" name:"files" help:"Audio files to process" type:"existingfile" optional:""`
 }
 
 // resolveJobs derives the worker count from the number of input files, capped
@@ -89,7 +91,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	if cliArgs.Cut < 0 {
+		cli.PrintError("--cut must not be negative")
+		os.Exit(1)
+	}
+
 	config := processor.DefaultFilterConfig()
+	config.SilenceTrim.Enabled = cliArgs.Silence
+	config.SilenceTrim.MaxDuration = cliArgs.Cut
 
 	debugLog, err := openDebugLog(cliArgs.Debug)
 	if err != nil {

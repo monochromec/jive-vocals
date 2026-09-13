@@ -151,7 +151,10 @@ jive-vocals [flags] <files...>
 | `-v, --version` | Show version and exit |
 | `-a, --analysis-only` | Run analysis only (Pass 1), display results, skip processing |
 | `-d, --debug` | Enable debug logging to `jive-vocals-debug.log` |
-| `--diagnostics` | Write extra diagnostic artefacts: before/after spectrogram PNGs plus `.intervals.jsonl`/`.candidates.jsonl` sidecars. Adds extra FFmpeg passes. Off by default |
+`-s, --silence` | Enable silence trimming in Pass 2 (see `--cut`). Off by default |
+| `-c, --cut` | Maximum silence duration to keep when `--silence` is enabled. Default `2s`; accepts any Go duration (`500ms`, `1m`, ...) |
+| `--diagnostics` | Write extra diagnostic artefacts: before/after spectrogram PNGs plus `.intervals.jsonl`/`.candidates.jsonl` 
+sidecars. Adds extra FFmpeg passes. Off by default |
 
 
 ### Examples
